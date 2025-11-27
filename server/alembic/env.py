@@ -32,10 +32,7 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 # Set the database URL from our settings
-config.set_main_option(
-    "sqlalchemy.url",
-    f"postgresql://{settings.db_user}:{settings.db_password}@{settings.db_host}:{settings.db_port}/{settings.db_name}"
-)
+config.set_main_option("sqlalchemy.url", settings.effective_database_url)
 
 # add your model's MetaData object here
 # for 'autogenerate' support

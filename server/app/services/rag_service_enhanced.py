@@ -542,23 +542,35 @@ Reformulated standalone query:"""
                     )
 
                 try:
+                    print("MCP Analysis: Starting MCP data analysis...")
+                    print(f"MCP Analysis: Available files: {len(csv_excel_files)}")
+                    for i, f in enumerate(csv_excel_files):
+                        cols = f.get('columns', [])
+                        print(f"MCP Analysis: File {i+1}: {f['filename']} - has_mcp: {f.get('has_mcp', False)}, columns: {len(cols)} ({', '.join(cols[:3])}{'...' if len(cols) > 3 else ''})")
+
+                    print("MCP Analysis: Creating EnhancedMCPTools instance")
                     from app.mcp.enhanced_tools import EnhancedMCPTools
                     enhanced_mcp_tools = EnhancedMCPTools(self.db, str(user_id))
+                    print("MCP Analysis: EnhancedMCPTools created successfully")
 
-                    # Ensure MCP processor can access the file metadata by syncing if needed
-                    if not hasattr(enhanced_mcp_tools.data_processor, 'file_metadata') or not enhanced_mcp_tools.data_processor.file_metadata:
-                        try:
-                            from app.mcp.data_processor import MCPDataProcessor
-                            temp_processor = MCPDataProcessor(settings, self.db)  # settings first, then DB
-                            await temp_processor.list_user_files(str(user_id))  # Ensure metadata is loaded
-                        except Exception as sync_err:
-                            print(f"Warning: MCP metadata preload failed: {sync_err}")
+                    # Ensure MCP processor has database access for persistent metadata
+                    if not enhanced_mcp_tools.data_processor.db:
+                        enhanced_mcp_tools.data_processor.db = self.db
+                        print("MCP Analysis: Database session assigned to MCP processor")
+                    else:
+                        print("MCP Analysis: MCP processor already has database access")
 
-                    # Create context for pandas code generation
-                    files_context = "\n".join([
-                        f"- {f['filename']}: columns {', '.join(f['columns'][:5])}{'...' if len(f['columns']) > 5 else ''}"
-                        for f in csv_excel_files
-                    ])
+                    # Create context for pandas code generation (with safe column access)
+                    files_context_lines = []
+                    for f in csv_excel_files:
+                        col_list = f.get('columns', [])
+                        col_desc = ', '.join(col_list[:5])
+                        if len(col_list) > 5:
+                            col_desc += '...'
+                        files_context_lines.append(f"- {f['filename']}: columns {col_desc} ({len(col_list)} total)")
+
+                    files_context = "\n".join(files_context_lines)
+                    print(f"MCP Analysis: Created file context with {len(files_context_lines)} files")
 
                     # Build chat history context (like POC approach)
                     chat_history_context = ""
@@ -579,16 +591,87 @@ Reformulated standalone query:"""
                         # Fallback to first file if AI selection fails
                         target_file = csv_excel_files[0]
 
+                    # DEBUG: Check if target file has columns before proceeding
+                    file_columns = target_file.get('columns', [])
+                    print(f"MCP Analysis: Selected file: {target_file['filename']} with {len(file_columns)} columns: {file_columns[:5]}{'...' if len(file_columns) > 5 else ''}")
+
+                    # FORCE column loading - try multiple methods to get columns
+                    if not file_columns:
+                        print("MCP Analysis: No columns found in file info, trying to load them...")
+
+                        # Method 1: Try to read directly from database metadata
+                        try:
+                            from app.models import McpFileMetadata
+                            mcp_file_id = target_file.get('file_id') or target_file.get('mcp_file_id')
+                            if mcp_file_id:
+                                db_file = self.db.query(McpFileMetadata).filter(McpFileMetadata.file_id == mcp_file_id).first()
+                                if db_file and db_file.columns:
+                                    file_columns = db_file.columns
+                                    print(f"MCP Analysis: ✓ Loaded {len(file_columns)} columns from database metadata")
+                        except Exception as db_err:
+                            print(f"MCP Analysis: ✗ Database metadata load failed: {db_err}")
+
+                        # Method 2: Try direct file reading via MCP processor
+                        if not file_columns:
+                            try:
+                                file_id = target_file.get('file_id', f"{target_file['user_id']}_{target_file['folder_id']}_{target_file['filename']}")
+                                columns = await enhanced_mcp_tools.data_processor.get_columns(file_id)
+                                if columns:
+                                    file_columns = columns
+                                    target_file['columns'] = columns
+                                    print(f"MCP Analysis: ✓ Loaded {len(file_columns)} columns by direct file reading")
+                            except Exception as col_err:
+                                print(f"MCP Analysis: ✗ Direct file reading failed: {col_err}")
+
+                        # Method 3: Attempt to create file_id and read (for files uploaded after fixes)
+                        if not file_columns:
+                            try:
+                                # Create the expected file_id format
+                                expected_file_id = f"{target_file['user_id']}_{target_file['folder_id']}_{target_file['filename']}"
+                                columns = await enhanced_mcp_tools.data_processor.get_columns(expected_file_id)
+                                if columns:
+                                    file_columns = columns
+                                    target_file['columns'] = columns
+                                    target_file['file_id'] = expected_file_id
+                                    print(f"MCP Analysis: ✓ Loaded {len(file_columns)} columns using expected file_id: {expected_file_id}")
+                            except Exception as exp_err:
+                                print(f"MCP Analysis: ✗ Expected file_id method failed: {exp_err}")
+
+                        if file_columns:
+                            print(f"MCP Analysis: SUCCESS - File now has {len(file_columns)} columns available for analysis")
+                        else:
+                            print("MCP Analysis: FAILURE - Could not load columns for data analysis")
+
+                    # Now proceed with analysis if we have any columns OR try columnless analysis
+                    can_proceed = bool(file_columns)
+                    print(f"MCP Analysis: Can proceed with analysis: {can_proceed} (columns: {len(file_columns) if file_columns else 0})")
+
+                    if not can_proceed:
+                        fallback_response = await self._generate_fallback_response(
+                            question=latest_user_message,
+                            files_info=csv_excel_files
+                        )
+
+                        return ChatResponse(
+                            role="assistant",
+                            content=f"I'm sorry, but I can't analyze '{latest_user_message}' with the available data files. The selected file ({target_file['filename']}) doesn't have accessible column information for analysis.\n\nFallback: {fallback_response}",
+                            sources=[],
+                            total_chunks=0,
+                            processing_time=time.time() - start_time,
+                            reformulated_query=latest_user_message
+                        )
+
                     # ENHANCED QUESTION PROCESSING: Deep understanding and reframing for better analysis
-                    print(f"MCP Analysis: Selected file: {target_file['filename']} with columns: {target_file['columns']}")
+                    print("MCP Analysis: Deeply understanding the question and reframing for data analysis...")
 
                     # Add question preprocessing to better understand and map to columns
                     enhanced_question = await self._preprocess_mcp_question(latest_user_message, target_file)
-                    print(f"MCP Analysis: Original question: '{latest_user_message}' → Enhanced: '{enhanced_question}'")
+                    print(f"MCP Analysis: ✓ Question reframed: '{enhanced_question}'")
 
                     # Generate pandas code using the enhanced question and selected file
                     target_file_list = [target_file]  # Pass as list for consistency
 
+                    print(f"MCP Analysis: 🧠 Generating pandas code for: '{enhanced_question}'")
                     pandas_generated = await self._generate_pandas_code(
                         question=enhanced_question,  # Use enhanced question for better results
                         files_context="",  # Will be set inside
@@ -596,10 +679,10 @@ Reformulated standalone query:"""
                         available_files=target_file_list  # Use only the selected file
                     )
 
-                    print(f"MCP Analysis: Generated pandas code: {pandas_generated.get('description', 'N/A')} -> {pandas_generated.get('pandas_code', 'N/A')}")
+                    print(f"MCP Analysis: ✓ Pandas code generated: {pandas_generated.get('description', 'N/A')}")
 
                     if pandas_generated and "error" not in pandas_generated:
-                        print(f"MCP Analysis: Executing pandas code: {pandas_generated['pandas_code']}")
+                        print(f"MCP Analysis: 🔄 Executing: {pandas_generated['pandas_code']}")
                         # Execute the generated pandas operations on the selected file
                         result = await enhanced_mcp_tools.query_data(
                             file_id=target_file["file_id"],
@@ -609,12 +692,16 @@ Reformulated standalone query:"""
                             question=latest_user_message
                         )
 
+                        print(f"MCP Analysis: ✅ Raw result obtained: {type(result)}")
+
                         # Format natural response from raw result
                         natural_response = await self._format_mcp_response(
                             question=latest_user_message,
                             raw_result=result.get("result"),
                             filename=target_file["filename"]
                         )
+
+                        print(f"MCP Analysis: 🎨 Response formatted: {len(natural_response)} characters")
 
                         return ChatResponse(
                             role="assistant",
@@ -633,6 +720,7 @@ Reformulated standalone query:"""
                             reformulated_query=latest_user_message
                         )
                     else:
+                        print(f"MCP Analysis: ❌ Pandas code generation failed: {pandas_generated}")
                         # Fallback response
                         fallback_response = await self._generate_fallback_response(
                             question=latest_user_message,
@@ -922,15 +1010,14 @@ Reformulated standalone query:"""
                     'mcp_file_id': doc.doc_metadata.get('mcp_file_id') if doc.doc_metadata else None,
                     'content_analysis': doc.doc_metadata.get('content_analysis', {}) if doc.doc_metadata else {}
                 }
-                all_csv_excel_docs.append(file_info)
 
-                # If it has MCP metadata, add to MCP files list
+                # If it has MCP metadata, try to get full details
                 if file_info['has_mcp']:
                     mcp_file_id = doc.doc_metadata['mcp_file_id']
                     try:
                         from app.mcp.data_processor import MCPDataProcessor
                         from app.config import settings
-                        mcp_processor = MCPDataProcessor(settings)
+                        mcp_processor = MCPDataProcessor(settings, self.db)  # Pass database session
 
                         user_folder_files = await mcp_processor.list_user_files(str(user_id))
                         matching_file = next(
@@ -943,12 +1030,45 @@ Reformulated standalone query:"""
                             file_info.update({
                                 'file_id': matching_file['file_id'],
                                 'columns': matching_file['columns'],
-                                'row_count': matching_file['row_count'],
-                                'folder_id': matching_file['folder_id']
+                                'row_count': matching_file['row_count']
                             })
                             mcp_files.append(file_info)
+                            all_csv_excel_docs.append(file_info)  # Add enriched version to all files
+                        else:
+                            # MCP file exists in doc metadata but not found in MCP processor
+                            print(f"Warning: MCP file {mcp_file_id} not found in MCP processor")
+                            all_csv_excel_docs.append(file_info)
                     except Exception as e:
                         print(f"Error checking MCP file {mcp_file_id}: {e}")
+                        all_csv_excel_docs.append(file_info)
+                else:
+                    # No MCP metadata, try to get basic column info from the file
+                    try:
+                        from app.mcp.data_processor import MCPDataProcessor
+                        from app.config import settings
+                        mcp_processor = MCPDataProcessor(settings, self.db)
+
+                        # Init the processor with DB to sync metadata
+                        await mcp_processor.sync_with_database(self.db)
+
+                        # Create a temp file_id based on the file path for processing
+                        temp_file_id = f"{user_id}_{doc.folder_id}_{doc.filename}"
+
+                        # Get column info if available
+                        try:
+                            columns = await mcp_processor.get_columns(temp_file_id)
+                            file_info['columns'] = columns
+                            file_info['row_count'] = await mcp_processor.read_file(temp_file_id)
+                            file_info['row_count'] = len(file_info['row_count']) if hasattr(file_info['row_count'], '__len__') else 0
+                        except Exception as col_err:
+                            print(f"Could not get columns for {doc.filename}: {col_err}")
+                            file_info['columns'] = []  # Default empty list
+
+                        all_csv_excel_docs.append(file_info)
+                    except Exception as proc_err:
+                        print(f"Error processing non-MCP file {doc.filename}: {proc_err}")
+                        file_info['columns'] = []  # Default empty list
+                        all_csv_excel_docs.append(file_info)
 
         except Exception as e:
             print(f"Error checking CSV/Excel files: {e}")
@@ -1015,9 +1135,9 @@ RESPONSE: Return only "STRUCTURED" or "DOCUMENT"
             print(f"OpenAI question analysis: '{query}' → {classification}")
 
             if is_structured:
-                print(f"🧠 QUESTION TYPE: STRUCTURED DATA → routing to MCP analysis with {len(mcp_files or all_csv_excel_docs)} available files")
-                # Return MCP-ready files for structured data analysis
-                return True, mcp_files or all_csv_excel_docs
+                print(f"🧠 QUESTION TYPE: STRUCTURED DATA → routing to MCP analysis with {len(all_csv_excel_docs)} available files")
+                # Return ALL files that attempted column processing (may have empty columns if processing failed)
+                return True, all_csv_excel_docs
             else:
                 print(f"📚 QUESTION TYPE: DOCUMENT ANALYSIS → routing to RAG system (found {len(all_csv_excel_docs)} CSV files but ignoring for document questions)")
                 return False, []

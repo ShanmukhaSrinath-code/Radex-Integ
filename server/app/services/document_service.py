@@ -130,7 +130,7 @@ class DocumentService:
             if file_type.lower() in ['csv', 'xlsx', 'xls']:
                 try:
                     print(f"Attempting MCP upload for {file.filename}")
-                    mcp_processor = MCPDataProcessor(settings)
+                    mcp_processor = MCPDataProcessor(settings, self.db)
                     mcp_result = await mcp_processor.upload_file(
                         file_data=file_content,
                         filename=file.filename,

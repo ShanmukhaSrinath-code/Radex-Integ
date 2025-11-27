@@ -186,10 +186,85 @@ class MCPDataProcessor:
                         print(f"Loaded file metadata from database for file_id: {file_id}")
                         print(f"DEBUG: Loaded metadata object_name: {metadata['object_name']}")
                     else:
+                        # File not in MCP database, try to create metadata on-the-fly
+                        print(f"MCP metadata not found for file {file_id}, attempting on-the-fly metadata creation...")
+
+                        # Extract components from file_id format: {user_id}_{folder_id}_{filename}
+                        # User_id and folder_id are UUIDs (36 chars), filename is the rest
+                        # Split into exactly 3 parts by taking first UUID, second UUID, and rest as filename
+                        import re
+                        uuid_pattern = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+
+                        match = re.match(rf'^({uuid_pattern})_({uuid_pattern})_(.*)$', file_id)
+                        if match:
+                            user_id, folder_id, filename = match.groups()
+                            print(f"Extracted user_id: {user_id}, folder_id: {folder_id}, filename: {filename}")
+
+                            # Try to read the file directly from MinIO
+                            object_name = f"mcp/{user_id}/{folder_id}/{filename}"
+                            try:
+                                df = await self._read_file_from_minio(object_name)
+                                print(f"Successfully read file from MinIO, creating MCP metadata...")
+
+                                # Analyze file content
+                                content_analysis = self._analyze_file_content(df, filename)
+
+                                # Create MCP metadata in database
+                                if self.db:
+                                    from uuid import uuid4
+                                    db_metadata = McpFileMetadata(
+                                        file_id=file_id,
+                                        user_id=user_id,
+                                        folder_id=folder_id,
+                                        filename=filename,
+                                        object_name=object_name,
+                                        file_type='csv' if filename.lower().endswith('.csv') else 'excel',
+                                        file_size=0,  # We don't know, but will be set later if needed
+                                        row_count=len(df),
+                                        columns=list(df.columns)
+                                    )
+
+                                    # Store enhanced metadata as JSON in doc_metadata field
+                                    enhanced_metadata = {
+                                        'content_analysis': content_analysis,
+                                        'domain': content_analysis['domain'],
+                                        'intent_keywords': content_analysis['intent_keywords'],
+                                        'semantic_tags': content_analysis['semantic_tags']
+                                    }
+                                    db_metadata.doc_metadata = enhanced_metadata
+
+                                    self.db.add(db_metadata)
+                                    self.db.commit()
+                                    print(f"Created MCP metadata in database for on-the-fly file: {file_id}")
+
+                                    # Store in memory cache
+                                    metadata = {
+                                        'upload_time': current_time,
+                                        'file_size': 0,
+                                        'file_type': 'csv' if filename.lower().endswith('.csv') else 'excel',
+                                        'columns': list(df.columns),
+                                        'row_count': len(df),
+                                        'folder_id': folder_id,
+                                        'user_id': user_id,
+                                        'object_name': object_name,
+                                        'filename': filename,
+                                        'content_analysis': content_analysis
+                                    }
+                                    self.file_metadata[file_id] = metadata
+                                    print(f"Stored MCP file metadata in memory cache: {file_id}")
+                                else:
+                                    print("No database connection available for MCP metadata creation")
+                                    raise BadRequestException(f"File metadata not found and no database for on-the-fly creation: {file_id}")
+                            except Exception as minio_err:
+                                print(f"Failed to read file from MinIO for metadata creation: {minio_err}")
+                                raise BadRequestException(f"File not found in MCP database and couldn't read from storage: {file_id}")
+                        else:
+                            print(f"Couldn't parse file_id format: {file_id}")
+                            raise BadRequestException(f"File metadata not found and couldn't parse file_id: {file_id}")
+
                         # Let's see all files in DB to debug
                         all_files = self.db.query(McpFileMetadata).all()
                         print(f"DEBUG: All file IDs in database: {[f.file_id for f in all_files]}")
-                        raise BadRequestException(f"File metadata not found in database: {file_id}")
                 except Exception as db_err:
                     print(f"Database query failed for file {file_id}: {db_err}")
                     import traceback

@@ -36,8 +36,7 @@ async def upload_document(
         uploaded_by=current_user.id
     )
 
-    # Only process embeddings for non-CSV/Excel files
-    # CSV/Excel files use MCP processing instead
+    # Process embeddings for non-CSV/Excel files
     if document.file_type.lower() not in ['csv', 'xlsx', 'xls']:
         # Start background task to process embeddings
         try:
@@ -45,6 +44,7 @@ async def upload_document(
         except Exception as e:
             # Log the error but don't fail the upload
             print(f"Failed to process embeddings for document {document.id}: {e}")
+    # Note: MCP processing for CSV/Excel files is handled in DocumentService.upload_document()
     
     return DocumentUploadResponse(
         id=document.id,
